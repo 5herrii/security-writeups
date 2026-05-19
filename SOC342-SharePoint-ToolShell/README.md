@@ -11,11 +11,15 @@
 
 Got a critical alert for a suspicious POST request hitting our SharePoint server. The request came from an external IP and targeted an internal admin endpoint (`ToolPane.aspx`) without any authentication. Device action was Allowed, meaning it went through.
 
+![Alert Overview](01-alert-overview.png)
+
 The CVE tied to this is **CVE-2025-53770**, also called ToolShell. It's a zero-day in on-premises SharePoint that lets an unauthenticated attacker send a crafted request and get code execution on the server. No credentials needed, no user has to click anything.
 
 ---
 
 ## Alert Info
+
+![Alert Details](02-alert-details.png)
 
 ```
 EventID         : 320
@@ -38,15 +42,29 @@ Device Action   : Allowed
 
 Before touching logs I checked the source IP and CVE in the Threat Intel tab. Found two hits from OnlyHunt, both tagged CVE-2025-53770 and dated the same day as the attack: a hash and the IP `107.191.58.76`. That confirmed right away this wasn't a false alarm.
 
+![Threat Intel Results](03-threat-intel-results.png)
+
 ### Log Management
 
 Searched logs for `107.191.58.76`. One result came back: a proxy log showing the POST request to ToolPane.aspx at exactly 01:07 PM. No scanning traffic before it, no failed attempts, just one clean hit. That tells me this was scripted and targeted, not someone manually poking around.
 
+![Log Search Filter](04-log-search-filter.png)
+
+![Log Event Details](05-log-event-details.png)
+
 The referer header was set to `/_layouts/SignOut.aspx`. That's the attacker spoofing a signed-out session to trick the auth bypass logic. Combined with a 7699 byte payload, it matched the known exploit pattern for this CVE exactly.
+
+![Log Raw Request](06-log-raw-request.png)
 
 ### Endpoint | SharePoint01
 
-Pulled up the process logs for SharePoint01 and sorted by time around 01:07 PM. Here's what the process tree looked like:
+Pulled up the process logs for SharePoint01 and sorted by time around 01:07 PM.
+
+![Endpoint SharePoint01](07-endpoint-sharepoint01.png)
+
+Here's what the process tree looked like:
+
+![Process Tree](10-process-tree.png)
 
 ```
 13:06:00  svchost.exe       parent: services.exe      [normal]
@@ -61,7 +79,19 @@ The first two are just normal Windows activity. Everything from 13:07:11 is the 
 
 `w3wp.exe` is the IIS process that runs SharePoint. It should never be spawning PowerShell. Seeing that as a parent-child relationship is an immediate red flag. It means the web request was processed and code ran on the server.
 
-The PowerShell command:
+![w3wp Spawns PowerShell](13-w3wp-spawns-powershell.png)
+
+![w3wp Command Line](11-w3wp-commandline.png)
+
+![w3wp Command Line Popup](14-w3wp-commandline-popup.png)
+
+The PowerShell process detail:
+
+![PowerShell Process](08-powershell-process.png)
+
+The full encoded command:
+
+![Encoded Command](09-encoded-command.png)
 
 ```
 powershell.exe -nop -w hidden -e PCVAIEltcG9ydCBOYW1lc3BhY2U...
@@ -71,7 +101,11 @@ powershell.exe -nop -w hidden -e PCVAIEltcG9ydCBOYW1lc3BhY2U...
 
 ### Decoding the Payload
 
-Threw the Base64 string into CyberChef with a From Base64 operation. What came out was an ASPX webshell:
+Threw the Base64 string into CyberChef with a From Base64 operation.
+
+![CyberChef Decode](12-cyberchef-decode.png)
+
+What came out was an ASPX webshell:
 
 ```csharp
 <%@ Import Namespace="System.Diagnostics" %>
@@ -94,7 +128,7 @@ Threw the Base64 string into CyberChef with a From Base64 operation. What came o
 
 This is using .NET Reflection to access a non-public method (`GetApplicationConfig`) and pull out SharePoint's MachineKeys. Specifically the `ValidationKey` and `DecryptionKey`.
 
-Those keys are what SharePoint uses to sign and encrypt session tokens. If an attacker has them they can forge authentication cookies and log in as anyone, including farm admins, without knowing a single password. They can also use them to craft malicious ViewState payloads that trigger more RCE, so even if you remove the webshell, they still have a way back in until the keys are rotated.
+Those keys are what SharePoint uses to sign and encrypt session tokens. If an attacker has them they can forge authentication cookies and log in as anyone, including farm admins, without knowing a single password. They can also craft malicious ViewState payloads that trigger more RCE, so even if you remove the webshell, they still have a way back in until the keys are rotated.
 
 Worth noting: my local antivirus blocked me from running the decode in PowerShell, which is actually a good sign. Means the payload is genuinely flagged as malicious by AV, not just suspicious.
 
@@ -123,6 +157,8 @@ Worth noting: my local antivirus blocked me from running the decode in PowerShel
 ## Containment
 
 Isolated SharePoint01 through LetsDefend's endpoint containment. Host confirmed contained.
+
+![Host Contained](15-host-contained.png)
 
 One thing I flagged separately: the last login on SharePoint01 was July 23, the day after the attack. That needs to be looked into to determine if it was a legitimate admin login or the attacker coming back using a forged token.
 
